@@ -1,0 +1,228 @@
+---
+title: "Temp study - threshold sensitivy analysis and plot creation"
+author: "Stavros Oikonomou"
+date: "02/10/2020"
+output: html_document
+---
+
+
+```{r libraries, include=FALSE}
+rm(list = ls(all=TRUE))
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# usage
+packages <- c("readxl", "pracma", "chron", "dplyr", "reshape2", "tidyr", 
+              "data.table","plyr","data.table","knitr","Hmisc","nortest",
+              "ggplot2","sjPlot","tidyverse","lubridate", "tableone", 
+              "lme4","reshape","corrplot", "xts","forcats","ggpubr")
+
+ipak(packages)
+```
+
+
+```{r loading the dataset,  include=FALSE}
+############ READING THE DATA #################
+
+#reading all the data 
+# write path for sensors data
+path = paste0(getwd(),"/new/")
+
+# create list of sensors data files
+files <- list.files(path, pattern = ".csv")
+# read first file of the list
+DF <-  read.csv(paste0(path,files[1]), header=T, sep=";")
+# add filename as a column in the first sensor data file
+DF$FILENAME<-as.character(files[1])
+
+# read each sensor data file and append them to create one file
+for (f in files[-1]){
+  df <- read.csv(paste0(path,f), header=T, sep=";")      # read the file
+  df$FILENAME<-as.character(f)                        # add filename as column
+  DF <- rbind(DF, df)                                   # append the current file
+}
+
+# fixing entries for T42-S1. He has index for every second and values every 30 sec.
+T42_S1 <- DF[DF$FILENAME=="T42_S1new.csv",]
+T42_S1 <- T42_S1[!is.na(T42_S1$Temperature),]
+T42_S1 <- T42_S1[seq(1,2880,2),]
+
+
+DF <- DF[DF$FILENAME!="T42_S1new.csv",]
+DF <- rbind(DF,T42_S1)
+
+# deleting the 1441st entry 
+DF<- DF %>% 
+  group_by(FILENAME) %>% 
+  slice(1:1440)
+
+# remove rows with no values for temperature
+DF <- DF %>%
+  filter(!is.na(Temperature)) 
+
+#Seperate the Date variable into 2 other "Date" and "Time"
+tempdata1<-tidyr::separate(DF, Date, c("Date", "Time"), sep = "--")
+
+# create Code variable by deleting 7 characters from FILENAME
+# FILENAME needs to be character
+tempdata1$FILENAME<-as.character(tempdata1$FILENAME)
+tempdata1$Code<- substr(tempdata1$FILENAME, 
+                        start=1,
+                        stop=nchar(tempdata1$FILENAME)-10)
+
+# create order variable by starting from position 6 and deleting 4 characters from FILENAME
+tempdata1$order<- substr(tempdata1$FILENAME, 
+                         start=5,
+                         stop=nchar(tempdata1$FILENAME)-7)
+
+# create temp type variable (air (a) or skin(s)) by starting from position 5 
+# and deleting 5 characters from FILENAME
+tempdata1$temp_type<- substr(tempdata1$FILENAME, 
+                             start=5,
+                             stop=nchar(tempdata1$FILENAME)-8)
+
+## create Code_order variable by merging Code and order variables 
+tempdata1$Code_order <- paste(tempdata1$Code, tempdata1$order, sep = "-")
+
+# convert Code_order and Code to factors
+tempdata1[, c("Code_order", "Code")]<-lapply(
+  tempdata1[, c("Code_order", "Code")],
+  factor)
+
+# create subset with variables needed only: date, temperature, activity, code_order
+tempdata<-subset(tempdata1, select=c(Code, Code_order, order, Date,Time, 
+                                     Temperature, temp_type,Activity)) 
+rm(tempdata1,DF, df,T42_S1)
+```
+
+```{r group_setting,include=FALSE}
+
+# Loading the file with the group information
+basic <- read.csv("./temp_files/Recruitment Management Form-use in R.csv", sep=";")
+group <- basic[,1:2] # removing anything except code and group
+group <- group[-c(15,26,30,39),] # removing this participants. reject to participate. 
+group_1 <- filter(group, Group=="1")
+group_2 <- filter(group,Group=="2")
+
+part_g1 <- group_1$Code  
+part_g2 <- group_2$Code
+
+# we gonna set 1==urban area and 2==rural area
+# group 1 participants start from city and then go to mountain
+
+tempdata_1 <- tempdata %>% filter(Code %in% part_g1) %>% 
+  mutate(settings=ifelse(order %in% c("A1","S1"),"1","2")) %>% mutate(Group="1")
+
+# change the order for participants in second group
+
+tempdata_2 <- tempdata %>% filter(Code %in% part_g2) %>%
+  mutate(settings=ifelse(order %in% c("A1","S1"),"2","1")) %>% mutate(Group="2")
+
+tempdata_final <- rbind(tempdata_1,tempdata_2) %>% 
+  mutate(order=paste0(temp_type,settings)) %>%
+  mutate(Code_order=paste(Code,order, sep = "-"))
+
+rm(tempdata_1,tempdata_2,tempdata,group,group_1,group_2)
+```
+
+```{r reading the data and removing temperature below 30, include=FALSE}
+# create a subset with skintemp and airtemp data only
+data_skin<-tempdata_final[which(tempdata_final$temp_type == "S"),]
+
+data_air<-tempdata_final[which(tempdata_final$temp_type == "A"),]
+
+data_skin <- subset(data_skin, Temperature>=30) # removing entries with temp below 30.
+```
+
+
+```{r creating the diary and activity diary, include=FALSE}
+# reading the diary that includes 4 wide categories (indoor,outdoor, unspecified, indoor_ac)
+diary<- read.csv("./temp_files/rdiaryfinal2.csv", header=T, na.strings=c("","NA"))
+
+#reading the diary that includes all activities (wake_up, sleep, housekeeping, being_at_work, driving, etc)
+diary_activities<- read.csv("./temp_files/diaryfinal2.csv", header=T, na.strings=c("","NA"))
+
+
+#using id and setting to create the code order column for dairy and air sensor
+diaryair <- diary %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryair_set1 <- diary %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryair_set2 <- diary %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+#using id and setting to create the code order column for dairy and skin sensor
+diaryskin <- diary %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryskin_set1 <- diary %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryskin_set2 <- diary %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+
+#using id and setting to create the code order column for activity dairy and air sensor
+adiaryair <- diary_activities %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryair_set1 <- diary_activities %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryair_set2 <- diary_activities %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+#using id and setting to create the code order column for activity dairy and skin sensor
+adiaryskin <- diary_activities %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryskin_set1 <- diary_activities %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryskin_set2 <- diary_activities %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+```
+
+```{r}
+######### PEAKS/TROUGHS FOR AIR TEMP ##########
+
+#we create the plots of the smoothed line of each participants'data 
+
+plots_func <- function(data,Code_order,threshold){
+  x <- data[which(data$Code_order == Code_order),]
+  x$Index1<-1:nrow(x)
+  loessMod5 <- loess(x$Temperature~Index1, data=x, span=0.1) # 10% smoothing span
+  x$smoothed5 <- predict(loessMod5) 
+  
+  pp <- findpeaks (x$smoothed5, nups = 1, ndowns = 0, minpeakheight = 0, minpeakdistance = 1, threshold = threshold, npeaks = 0, sortstr = FALSE)
+  plot(x$smoothed5, type = 'l',main=paste("Peaks and troughs of ",Code_order, "with threshold", threshold),ylab="Temperature",xlab="Date")
+  points(pp[,2],x$smoothed5[pp[,2]], col = 'red', pch = 19)
+}  
+```
+
+## Threshold sensitivity analysis on a subset of 10 random participants
+
+### For air sensors
+```{r}
+
+co_list <- c( "T10-A1","T11-A1","T15-A1","T24-A1","T29-A1", 
+              "T33-A1","T38-A1","T45-A1","T53-A1","T60-A1")
+
+for(i in co_list){
+  for(j in seq(0.1,0.7,0.1)){
+    plots_func(data_air,i,j)
+  }
+}
+```
+
+
+### For skin sensors
+```{r}
+
+co_list_skin <- c("T10-S1","T11-S1","T16-S2","T24-S1","T29-S1", 
+                  "T33-S2","T34-S2","T45-S1","T56-S1","T60-S2")
+
+for(i in co_list_skin){
+  for(j in seq(0.1,0.7,0.1)){
+    plots_func(data_skin,i,j)
+  }
+}
+```
