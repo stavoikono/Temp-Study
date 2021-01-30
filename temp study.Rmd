@@ -1,0 +1,1258 @@
+---
+title: "Temp study"
+author: "Stavros Oikonomou"
+date: "11/16/2020"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r libraries, include=FALSE}
+rm(list = ls(all=TRUE))
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# usage
+packages <- c("readxl", "pracma", "chron", "dplyr", "reshape2", "tidyr", 
+              "data.table","plyr","data.table","knitr","Hmisc","nortest",
+              "ggplot2","sjPlot","tidyverse","lubridate", "tableone", 
+              "lme4","reshape","corrplot", "xts","forcats","ggpubr")
+
+ipak(packages)
+```
+
+
+```{r loading the dataset,  include=FALSE}
+############ READING THE DATA #################
+
+#reading all the data 
+# write path for sensors data
+path = paste0(getwd(),"/new/")
+
+# create list of sensors data files
+files <- list.files(path, pattern = ".csv")
+# read first file of the list
+DF <-  read.csv(paste0(path,files[1]), header=T, sep=";")
+# add filename as a column in the first sensor data file
+DF$FILENAME<-as.character(files[1])
+
+# read each sensor data file and append them to create one file
+for (f in files[-1]){
+  df <- read.csv(paste0(path,f), header=T, sep=";")      # read the file
+  df$FILENAME<-as.character(f)                        # add filename as column
+  DF <- rbind(DF, df)                                   # append the current file
+}
+
+# fixing entries for T42-S1. He has index for every second and values every 30 sec.
+T42_S1 <- DF[DF$FILENAME=="T42_S1new.csv",]
+T42_S1 <- T42_S1[!is.na(T42_S1$Temperature),]
+T42_S1 <- T42_S1[seq(1,2880,2),]
+
+
+DF <- DF[DF$FILENAME!="T42_S1new.csv",]
+DF <- rbind(DF,T42_S1)
+
+# deleting the 1441st entry 
+DF<- DF %>% 
+  group_by(FILENAME) %>% 
+  slice(1:1440)
+
+# remove rows with no values for temperature
+DF <- DF %>%
+  filter(!is.na(Temperature)) 
+
+#Seperate the Date variable into 2 other "Date" and "Time"
+tempdata1<-tidyr::separate(DF, Date, c("Date", "Time"), sep = "--")
+
+# create Code variable by deleting 7 characters from FILENAME
+# FILENAME needs to be character
+tempdata1$FILENAME<-as.character(tempdata1$FILENAME)
+tempdata1$Code<- substr(tempdata1$FILENAME, 
+                        start=1,
+                        stop=nchar(tempdata1$FILENAME)-10)
+
+# create order variable by starting from position 6 and deleting 4 characters from FILENAME
+tempdata1$order<- substr(tempdata1$FILENAME, 
+                         start=5,
+                         stop=nchar(tempdata1$FILENAME)-7)
+
+# create temp type variable (air (a) or skin(s)) by starting from position 5 
+# and deleting 5 characters from FILENAME
+tempdata1$temp_type<- substr(tempdata1$FILENAME, 
+                             start=5,
+                             stop=nchar(tempdata1$FILENAME)-8)
+
+## create Code_order variable by merging Code and order variables 
+tempdata1$Code_order <- paste(tempdata1$Code, tempdata1$order, sep = "-")
+
+# convert Code_order and Code to factors
+tempdata1[, c("Code_order", "Code")]<-lapply(
+  tempdata1[, c("Code_order", "Code")],
+  factor)
+
+# create subset with variables needed only: date, temperature, activity, code_order
+tempdata<-subset(tempdata1, select=c(Code, Code_order, order, Date,Time, 
+                                     Temperature, temp_type,Activity)) 
+rm(tempdata1,DF, df,T42_S1)
+```
+
+```{r group_setting,include=FALSE}
+
+# Loading the file with the group information
+basic <- read.csv("./temp_files/Recruitment Management Form-use in R.csv", sep=";")
+group <- basic[,1:2] # removing anything except code and group
+group <- group[-c(15,26,30,39),] # removing this participants. reject to participate. 
+group_1 <- filter(group, Group=="1")
+group_2 <- filter(group,Group=="2")
+
+part_g1 <- group_1$Code  
+part_g2 <- group_2$Code
+
+# we gonna set 1==urban area and 2==rural area
+# group 1 participants start from city and then go to mountain
+
+tempdata_1 <- tempdata %>% filter(Code %in% part_g1) %>% 
+  mutate(settings=ifelse(order %in% c("A1","S1"),"1","2")) %>% mutate(Group="1")
+
+# change the order for participants in second group
+
+tempdata_2 <- tempdata %>% filter(Code %in% part_g2) %>%
+  mutate(settings=ifelse(order %in% c("A1","S1"),"2","1")) %>% mutate(Group="2")
+
+tempdata_final <- rbind(tempdata_1,tempdata_2) %>% 
+  mutate(order=paste0(temp_type,settings)) %>%
+  mutate(Code_order=paste(Code,order, sep = "-"))
+
+rm(tempdata_1,tempdata_2,tempdata,group,group_1,group_2)
+```
+
+```{r reading the data and removing temperature below 30, include=FALSE}
+# create a subset with skintemp and airtemp data only
+data_skin<-tempdata_final[which(tempdata_final$temp_type == "S"),]
+
+data_air<-tempdata_final[which(tempdata_final$temp_type == "A"),]
+
+data_skin <- subset(data_skin, Temperature>=30) # removing entries with temp below 30.
+```
+
+
+```{r creating the diary and activity diary, include=FALSE}
+# reading the diary that includes 4 wide categories (indoor,outdoor, unspecified, indoor_ac)
+diary<- read.csv("./temp_files/rdiaryfinal2.csv", header=T, na.strings=c("","NA"))
+
+#reading the diary that includes all activities (wake_up, sleep, housekeeping, being_at_work, driving, etc)
+diary_activities<- read.csv("./temp_files/diaryfinal2.csv", header=T, na.strings=c("","NA"))
+
+
+#using id and setting to create the code order column for dairy and air sensor
+diaryair <- diary %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryair_set1 <- diary %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryair_set2 <- diary %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+#using id and setting to create the code order column for dairy and skin sensor
+diaryskin <- diary %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryskin_set1 <- diary %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+diaryskin_set2 <- diary %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+
+#using id and setting to create the code order column for activity dairy and air sensor
+adiaryair <- diary_activities %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryair_set1 <- diary_activities %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryair_set2 <- diary_activities %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-A")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+#using id and setting to create the code order column for activity dairy and skin sensor
+adiaryskin <- diary_activities %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% 
+  select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryskin_set1 <- diary_activities %>% filter(Setting==1) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+
+adiaryskin_set2 <- diary_activities %>% filter(Setting==2) %>% mutate(Code_order=paste(ID,Setting, sep="-S")) %>% select(-ID,-Setting) %>% dplyr::arrange(Code_order)
+```
+
+
+```{r table_1, include=FALSE}
+# read data
+baseline<-read.csv(file="./temp_files/Demographics.csv", header=T, sep=";")
+#
+chrono<-read.csv(file="./temp_files/Chronotype_Revised_Theo.csv", header=T, sep=",")
+
+# merge the 3 dataframes by Code
+mergeddata_in<-Reduce(function(x, y) merge(x, y, all=TRUE, by="Code"),
+               list(baseline, basic, chrono))
+
+# change variable types into factors
+mergeddata_in[, c("Group","education_level","Smoking_status", "alcohol_freq",
+               "Physical_exercise","Travel_last_3_months", "Flight_frequency","Sex",
+               "Regular_work_schedule", "WD_alarm_on", "WD_awake_before_alarm",
+           "FD_alarm_on", "nofree_sleep_time", "children_Pets","Hobbies",
+           "Shift_worker","Schedule_type","Cig_frequency","Beer_frequency",
+           "Wine_frequency","Liquor_frequency","Coffee_frequency","Tea_frequency",
+           "Caffeine_frequency")]<-lapply(
+mergeddata_in[, c("Group","education_level","Smoking_status","alcohol_freq",
+               "Physical_exercise","Travel_last_3_months","Flight_frequency","Sex",
+               "Regular_work_schedule", "WD_alarm_on", "WD_awake_before_alarm",
+           "FD_alarm_on", "nofree_sleep_time","children_Pets","Hobbies",
+           "Shift_worker","Schedule_type","Cig_frequency","Beer_frequency",
+           "Wine_frequency","Liquor_frequency","Coffee_frequency","Tea_frequency",
+           "Caffeine_frequency")],
+             factor)
+
+# format dates
+mergeddata_in[, c("First_day_in_village", "Last_day_in_village",
+                  "First_Sampling_day","Second_Sampling_day")]<-lapply(
+mergeddata_in[, c("First_day_in_village", "Last_day_in_village",
+                  "First_Sampling_day","Second_Sampling_day")],
+             as.Date, format="%d/%m/%Y")
+
+# calculate BMI based on formula: weight/height(m)^2
+mergeddata_in$BMI<-mergeddata_in$Weight/((mergeddata_in$Height/100)^2)
+
+# create BMI categories:
+# underweight under 18.5 kg/m2, normal weight: 18.5 to 25, overweight: 25 to 30
+mergeddata_in$BMIcat <- cut(mergeddata_in$BMI,
+                      breaks=c(-Inf, 18.5, 25, 30, +Inf),
+                      labels=c("underweight","normal weight","overweight","obese"))
+
+# create chronotype categories:
+# early (<3:00), intermediate (3:00?5:00) and late (>5:00)
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5479630/,
+# https://onlinelibrary.wiley.com/doi/full/10.1111/j.1479-8425.2012.00541.x
+
+x=as.POSIXct(strptime(c("000000","030000","050000","235959"),
+                      "%H%M%S"),"UTC")
+mergeddata_in$Chronotype1 <- as.POSIXct(strptime((mergeddata_in$Chronotype),"%H:%M"),"UTC")
+
+labs=c("early","intermediate","late")
+mergeddata_in$Chronotypecat <-labs[findInterval(mergeddata_in$Chronotype1,x)]
+mergeddata_in$Chronotypecat <-as.factor(mergeddata_in$Chronotypecat)
+
+# revalue categorical variables to their actual values:
+
+mergeddata_in$Group <- revalue(mergeddata_in$Group, c("1"="First urban", "2"="First mountainous"))
+mergeddata_in$education_level <- revalue(mergeddata_in$education_level,
+                                    c("2"="Secondary",
+                                      "3"="University/college",
+                                      "4"="Master/PhD"))
+mergeddata_in$Smoking_status <- revalue(mergeddata_in$Smoking_status,
+                                    c("1"="Smoker", "2"="Non-smoker",
+                                      "3"="Former smoker"))
+mergeddata_in$alcohol_freq <- revalue(mergeddata_in$alcohol_freq,
+                                        c("2"="Weekly",
+                                          "3"="Monthly","4"="Rarely/Never"))
+mergeddata_in$Physical_exercise <- revalue(mergeddata_in$Physical_exercise,
+                                        c("1"="Yes", "2"="No"))
+mergeddata_in$Travel_last_3_months <- revalue(mergeddata_in$Travel_last_3_months,
+                                        c("1"="Yes", "2"="No"))
+mergeddata_in$Flight_frequency <- revalue(mergeddata_in$Flight_frequency,
+                                        c("1"="Every month", "2"="Every 3 months",
+                                          "3"="Irregular"))
+mergeddata_in$Sex <- revalue(mergeddata_in$Sex, c("1"="Female", "2"="Male"))
+mergeddata_in$Regular_work_schedule <- revalue(mergeddata_in$Regular_work_schedule,
+                                        c("1"="Yes", "2"="No", "9"=NA))
+mergeddata_in$nofree_sleep_time <- revalue(mergeddata_in$nofree_sleep_time,
+                                        c("1"="Yes", "2"="No", "9"=NA))
+mergeddata_in$Shift_worker <- revalue(mergeddata_in$Shift_worker,
+                                        c("1"="Yes", "2"="No"))
+mergeddata_in$Schedule_type <- revalue(mergeddata_in$Schedule_type,
+                                        c("1"="Very flexible", "2"="A little flexible",
+                                          "3"="Rather inflexible", "4"="Very inflexible"))
+
+
+# calculate washout period based on group
+# for Group 2: use of 5 days in order to account the first day in urban setting
+mergeddata_in$washout_days<-ifelse(
+  mergeddata_in$Group=="First mountainous",
+  mergeddata_in$Second_Sampling_day - 5 - mergeddata_in$Last_day_in_village,
+  ifelse(mergeddata_in$Group=="First urban",
+           mergeddata_in$First_day_in_village - mergeddata_in$First_Sampling_day,
+         NA))
+
+# calculate days in village based on group
+mergeddata_in$days_mountain<-ifelse(
+  mergeddata_in$Group=="First mountainous",
+  mergeddata_in$First_Sampling_day - mergeddata_in$First_day_in_village,
+  ifelse(mergeddata_in$Group=="First urban",
+           mergeddata_in$Second_Sampling_day - mergeddata_in$First_day_in_village,
+         NA))
+
+
+# variable selection for basic demographic characteristics
+selectionDescr<-c("Age","Sex","BMI","BMIcat",
+                  "education_level","Chronotypecat", "Smoking_status",
+                  "alcohol_freq","Physical_exercise","screen_hours_day",
+                  "days_mountain","washout_days")
+
+categorvariablesDescr<-c("Sex","BMIcat",
+                         "education_level","Smoking_status","alcohol_freq",
+                         "Chronotypecat","Physical_exercise")
+mergeddata <- subset(mergeddata_in,
+                     !(mergeddata_in$Code == "T25"|        # no data
+                       mergeddata_in$Code == "T44"|
+                       mergeddata_in$Code == "T50"|
+                       mergeddata_in$Code == "T65"))        # no data
+
+rm(basic,baseline,mergeddata_in)
+```
+### Table 1 - Baseline characteristics - Study participants (overall and by group)
+
+`r kable(print(CreateTableOne(selectionDescr, data=mergeddata, factorVars=categorvariablesDescr)), caption="Baseline characteristics of participants")`
+
+`r kable(print(CreateTableOne(selectionDescr, data=mergeddata, factorVars=categorvariablesDescr, strata="Group")),caption="Baseline characteristics of participants by group")`
+
+### Summary table for ambient air temperature by setting taking in account all observations
+
+`r kable(print(CreateTableOne("Temperature", data=data_air, strata="settings"),testNonNormal = kruskal.test, nonnormal = "Temperature"), caption="Summary table of ambient air temperature by setting")`
+
+### Summary table for skin temperature by setting taking in account all observations
+
+`r kable(print(CreateTableOne("Temperature", data=data_skin, strata="settings"),testNonNormal = kruskal.test, nonnormal = "Temperature"), caption="Summary table of skin temperature by setting")`
+
+### Summary table of cumulative activity by settting based on skin sensors
+
+`r kable(print(CreateTableOne("Activity", data=data_skin, strata="settings"),testNonNormal = kruskal.test, nonnormal = "Activity"), caption="Summary table of cumulative activity per day based on skin sensors") `
+
+```{r boxplot of air temperature for all participants }
+ggplot(data_air, aes(x=Code_order, y=Temperature, fill=settings)) + geom_boxplot() + ggtitle("temperature boxplot for all code orders on skin data")
+```
+
+```{r boxplot of skin temperature for all participants}
+ggplot(data_skin, aes(x=Code_order, y=Temperature, fill=settings)) + geom_boxplot() + ggtitle("temperature boxplot for all code orders on skin data")
+```
+
+```{r proportion location table , echo=F, message=FALSE, warning=FALSE}
+# Find proportion of indoor and outdoor activities for the entries with only indoor and outdoor
+
+diary_t <- diary[,3:1442] #filtering the entries we want
+diary_t <- data.frame(t(diary_t)) # find transpose and rechange to data.frame
+
+indoor_counter <- vector() #indoor activities counter
+for(i in 1:ncol(diary_t)){
+  indoor_counter[i] <- length(diary_t[diary_t[,i]=="indoor_activities" & !is.na(diary_t[,i]) ,i]) 
+}
+
+outdoor_counter <- vector() #outdoor activities counter
+for(i in 1:ncol(diary_t)){
+  outdoor_counter[i] <- length(diary_t[diary_t[,i]=="outdoor_activities" & !is.na(diary_t[,i]) ,i])
+}
+
+counter <- vector() #indoor and outdoor activities counter
+for(i in 1:ncol(diary_t)){
+  counter[i]<- sum(diary_t[,i] %in% c("indoor_activities","outdoor_activities", na.rm=T))
+  }
+
+#create table with indoor, outdoor proportion  for indoor, outdoor entries only
+prop_table <- data.frame(indoor=round(indoor_counter/counter*100,2),
+                         outdoor=round(outdoor_counter/counter*100,2))
+
+#table with percentages of indoor, outdoor and NA
+stat_table <- data.frame(indoor=round(indoor_counter/1440*100,2),
+                         outdoor=round(outdoor_counter/1440*100,2),
+                         NA_count=round(sapply(diary_t, function(x) sum(is.na(x)))/1440,2),
+                         row.names = paste(diary$ID,diary$Setting,sep="-X"))
+
+
+hist(prop_table$indoor)
+prop_table2 <- melt(prop_table)
+```
+
+
+### Summary table of proportion of Indoor/Outdoor
+
+`r kable(print(CreateTableOne("value", data=prop_table2, strata="variable"),testNonNormal = kruskal.test, nonnormal = "value"), caption="Summary table of proportion of Indoor/Outdoor")`
+
+```{r threshold function, include=FALSE}
+#Create a function to calculate the number of peaks for given participant and threshold
+
+plot_peak_count <- function(Code_order,threshold,data){
+  x <- data[which(data$Code_order == Code_order),]
+  x$Index1<-1:nrow(x) # creating a index
+  loessMod5 <- loess(x$Temperature~Index1, data=x, span=0.1) # 10% smoothing span
+  x$smoothed5 <- predict(loessMod5) #smoothed temperature
+  # pickfind function
+  pp <- findpeaks (x$smoothed5, nups = 1, ndowns = 0, minpeakheight = 0, 
+                   minpeakdistance = 1, threshold = threshold, npeaks = 0, sortstr = FALSE)
+  data.peaks<-data.frame(data.smoothed5=pp)
+  z<<-nrow(data.peaks) #number of peaks extracted
+  return(z) # number of peaks exported
+}
+
+# code orders for air data
+co_listA <- c("T10-A1","T11-A1","T12-A1","T13-A1","T14-A1","T15-A1","T16-A1",
+              "T17-A1","T18-A1","T19-A1","T21-A1","T22-A1","T23-A1","T24-A1",
+              "T26-A1","T29-A1","T31-A1","T33-A1","T34-A1","T35-A1","T37-A1",
+              "T38-A1","T46-A1","T47-A1","T51-A1","T52-A1","T53-A1","T56-A1",
+              "T60-A1","T61-A1","T64-A1","T66-A1","T67-A1","T10-A2","T11-A2",
+              "T12-A2","T16-A2","T17-A2","T18-A2","T19-A2","T24-A2","T26-A2",
+              "T35-A2","T37-A2","T38-A2","T42-A2","T43-A2","T45-A2","T60-A2",
+              "T42-A1","T54-A1","T45-A1")
+#code orders for skin data
+co_listS <- c("T10-S1","T11-S1","T12-S1","T13-S1","T14-S1","T15-S1","T16-S1",
+              "T18-S1","T19-S1","T21-S1","T22-S1","T23-S1","T24-S1","T26-S1",
+              "T29-S1","T31-S1","T33-S1","T34-S1","T35-S1","T37-S1","T38-S1",
+              "T45-S1","T46-S1","T47-S1","T51-S1","T52-S1","T53-S1","T56-S1",
+              "T60-S1","T61-S1","T64-S1","T66-S1","T67-S1","T10-S2","T11-S2",
+              "T12-S2","T16-S2","T17-S2","T24-S2","T26-S2","T29-S2","T31-S2",
+              "T33-S2","T34-S2","T35-S2","T38-S2","T43-S2","T45-S2","T60-S2")
+```
+
+```{r air threshold matrix, include=FALSE}
+a01 <- vector() #number of peaks per participant for threshold=0.1
+for(i in co_listA){
+  k <- plot_peak_count(i,0.1,data_air)
+  a01 <- append(a01,k)
+}
+
+a02 <- vector() #number of peaks per participant for threshold=0.2
+for(i in co_listA){
+  k <- plot_peak_count(i,0.2,data_air)
+  a02 <- append(a02,k)
+}
+
+a03 <- vector() #number of peaks per participant for threshold=0.3
+for(i in co_listA){
+  k <- plot_peak_count(i,0.3,data_air)
+  a03 <- append(a03,k)
+}
+
+a04 <- vector() #number of peaks per participant for threshold=0.4
+for(i in co_listA){
+  k <- plot_peak_count(i,0.4,data_air)
+  a04 <- append(a04,k)
+}
+
+a05 <- vector() #number of peaks per participant for threshold=0.5
+for(i in co_listA){
+  k <- plot_peak_count(i,0.5,data_air)
+  a05 <- append(a05,k)
+}
+
+
+a06 <- vector() #number of peaks per participant for threshold=0.6
+for(i in co_listA){
+  k <- plot_peak_count(i,0.6,data_air)
+  a06 <- append(a06,k)
+}
+
+a07 <- vector() #number of peaks per participant for threshold=0.7
+for(i in co_listA){
+  k <- plot_peak_count(i,0.7,data_air)
+  a07 <- append(a07,k)
+}
+
+#creating a dataframe
+thrs_A <- rbind.data.frame(a01,a02,a03,a04,a05,a06,a07)
+names(thrs_A) <- co_listA
+
+#find the median per threshold value
+thrs_AM1 <- apply(thrs_A,1, median)
+rm(a01,a02,a03,a04,a05,a06,a07,thrs_A)
+```
+
+```{r skin threshold matrix, include=FALSE}
+t01 <- vector() #number of peaks per participant for threshold=0.1
+for(i in co_listS){
+  k <- plot_peak_count(i,0.1,data_skin)
+  t01 <- append(t01,k)
+}
+
+t02 <- vector() #number of peaks per participant for threshold=0.2
+for(i in co_listS){
+  k <- plot_peak_count(i,0.2,data_skin)
+  t02 <- append(t02,k)
+}
+
+t03 <- vector() #number of peaks per participant for threshold=0.3
+for(i in co_listS){
+  k <- plot_peak_count(i,0.3,data_skin)
+  t03 <- append(t03,k)
+}
+
+t04 <- vector() #number of peaks per participant for threshold=0.4
+for(i in co_listS){
+  k <- plot_peak_count(i,0.4,data_skin)
+  t04 <- append(t04,k)
+}
+
+t05 <- vector() #number of peaks per participant for threshold=0.5
+for(i in co_listS){
+  k <- plot_peak_count(i,0.5,data_skin)
+  t05 <- append(t05,k)
+}
+
+
+t06 <- vector() #number of peaks per participant for threshold=0.6
+for(i in co_listS){
+  k <- plot_peak_count(i,0.6,data_skin)
+  t06 <- append(t06,k)
+}
+
+t07 <- vector() #number of peaks per participant for threshold=0.6
+for(i in co_listS){
+  k <- plot_peak_count(i,0.7,data_skin)
+  t07 <- append(t07,k)
+}
+
+#creating a data frame
+thrs_S <- rbind.data.frame(t01,t02,t03,t04,t05,t06,t07)
+names(thrs_S) <- co_listS
+
+#find the median per threshold value
+thrs_SM1 <- apply(thrs_S,1, median)
+rm(t01,t02,t03,t04,t05,t06,t07,thrs_S)
+```
+
+```{r threshold plots, echo=FALSE}
+thrs_AM <- data.frame("threshold"=seq(0.1,0.7,0.1), "peaks"=thrs_AM1)
+ggplot(thrs_AM, aes(x=threshold,y=peaks)) + geom_line() + geom_point(size=3, colour="red") + ggtitle("threshold sensitivity analysis on number of peaks for Air sensor") + 
+  theme_classic() + scale_x_continuous(breaks = seq(0.1,0.7,0.1))
+
+thrs_SM <- data.frame("threshold"=seq(0.1,0.7,0.1), "peaks"=thrs_SM1)
+ggplot(thrs_SM, aes(x=threshold,y=peaks)) + geom_line() + geom_point(size=3, colour="red") + ggtitle("threshold sensitivity analysis on number of peaks for Skin sensor") + 
+  theme_classic() + scale_x_continuous(breaks = seq(0.1,0.7,0.1))
+```
+
+```{r, include=FALSE}
+rm(thrs_A,thrs_AM,thrs_AM1,thrs_S,thrs_SM,thrs_SM1)
+```
+
+```{r peak finder function, include=FALSE}
+ #### using activity groups
+ ###### function to find the peaks
+
+peaks <- function(Code_order,data,set){
+  x <- data[which(data$Code_order == Code_order),]
+  x$Index1<-1:nrow(x)
+  
+  #merge the diary data 
+  #diary data has only the participants' code and setting, not the type of the sensor
+  #in order to merge the diary with the air/skin sensors we create two subsets-dataframes 
+  y<-set[which(set$Code_order == Code_order),]
+  y<-data.frame(t(y))
+  
+  names(y)="X1"<-"Location" #rename X1 to location
+
+  #create another variable Index1 to be able to merge sensors data with diary data by it. (Index1 refers to time)
+  y$Index1<-1:nrow(y)
+  x<-merge(x = x, y = y, by = "Index1", all = TRUE)
+  x<-x[!(is.na(x$Temperature)) , ]
+  #smoothed the linegraph
+  loessMod5 <- loess(x$Temperature~Index1, data=x, span=0.1) # 10% smoothing span
+  x$smoothed5 <- predict(loessMod5) 
+
+  #find peaks 
+  pp <- findpeaks (x$smoothed5, nups = 1, ndowns = 0, minpeakheight = 0, minpeakdistance = 1, 
+                   threshold = 0.2, npeaks = 0, sortstr = FALSE)
+  #create a data frame showing the location of peaks/troughs  
+  data.peaks=data.frame(data.smoothed5=pp)
+  
+  #number of peaks
+  peaks1<-subset(data.peaks, select = data.smoothed5.2)
+  names(peaks1)='data.smoothed5.2'<- 'peaks'
+  
+  #find the sum of the peaks
+  peaks1$pnum_p<-nrow(peaks1)
+  #keep only one value for the sum to have a dataframe with 1 obs and 10 variables
+  peaks1<-setDT(peaks1)[, head(.SD,1)]
+  
+  #moving the sum of peaks into a new dataframe
+  numpeaks_skin<-subset(peaks1, select=pnum_p)
+  
+  #create dataset with temp values only and rename the variable 
+  z<-subset(data.peaks, select = c(data.smoothed5.1))
+  names(z)="data.smoothed5.1"<-"peaks"
+  
+  #matching the temp values with the original dataset to find the time of peaks
+  d1 <- data.table(z, key = 'peaks')
+  d2 <- data.table(x, key = 'smoothed5')
+  peaks1<-d2[d1]
+  
+  #create subset and rename the col names
+  z<-subset(peaks1, select=c(Code_order, smoothed5, Time, Location, Date))
+  names(z)[2] = "smoothed5" <- "P_temperature"
+  names(z) [3]= "Time"<- "P_time"
+  names(z) [4]= "Location"<- "P_location"
+  names(z) [5]= "Date"<- "P_date"
+  
+  df2p <- within(z, count <- ave(rep(1,nrow(z)),z$Code_order,FUN=cumsum))
+
+    return(df2p)
+}
+
+tnum_a1 <- c("T10-A1","T11-A1","T12-A1","T13-A1","T14-A1","T15-A1","T16-A1","T17-A1","T18-A1",
+             "T19-A1","T21-A1","T22-A1","T23-A1","T24-A1","T26-A1","T29-A1","T31-A1","T33-A1",
+             "T34-A1","T35-A1","T37-A1","T38-A1","T46-A1","T47-A1","T51-A1","T52-A1","T53-A1",
+             "T56-A1","T60-A1","T61-A1","T64-A1","T66-A1","T67-A1")
+
+tnum_a2 <- c("T10-A2","T11-A2","T12-A2","T16-A2","T17-A2","T18-A2","T19-A2","T24-A2",
+             "T26-A2","T35-A2","T37-A2","T38-A2","T42-A2","T43-A2","T45-A2","T60-A2")
+
+tnum_s1 <- c("T10-S1","T11-S1","T12-S1","T13-S1","T14-S1","T15-S1","T16-S1","T18-S1","T19-S1",
+             "T21-S1","T22-S1","T23-S1","T24-S1","T26-S1","T29-S1","T31-S1","T33-S1","T34-S1",
+             "T35-S1","T37-S1","T38-S1","T45-S1","T46-S1","T47-S1","T51-S1","T52-S1","T53-S1",
+             "T56-S1","T60-S1","T61-S1","T64-S1","T66-S1","T67-S1")
+             
+tnum_s2 <- c("T10-S2","T11-S2","T12-S2","T16-S2","T17-S2","T24-S2","T26-S2","T29-S2",
+             "T31-S2","T33-S2","T34-S2","T35-S2","T38-S2","T43-S2","T45-S2","T60-S2")
+```
+
+```{r finding the peaks and creating the plots, include=F}
+peaks_air1 <- data.frame()
+for(i in tnum_a1){
+  dff <- peaks(i,data_air,diaryair_set1)
+  peaks_air1 <- rbind.fill(peaks_air1,dff)
+}
+
+peaks_air2 <- data.frame()
+for(i in tnum_a2){
+  dff <- peaks(i,data_air,diaryair_set2)
+  peaks_air2 <- rbind.fill(peaks_air2,dff)
+}
+
+peaks_air_all <- rbind.fill(peaks_air1,peaks_air2)
+
+peaks_skin1 <- data.frame()
+for(i in tnum_s1){
+  dff <- peaks(i,data_skin,diaryskin_set1)
+  peaks_skin1 <- rbind.fill(peaks_skin1,dff)
+}
+
+peaks_skin2 <- data.frame()
+for(i in tnum_s2){
+  dff <- peaks(i,data_skin,diaryskin_set2)
+  peaks_skin2 <- rbind.fill(peaks_skin2,dff)
+}
+
+peaks_skin_all <- rbind.fill(peaks_skin1,peaks_skin2)
+rm(dff)
+```
+
+```{r find the peaks and activity , include=F}
+# finding the peaks and the activity status of the peak this current moment.
+apeaks_air1 <- data.frame()
+for(i in tnum_a1){
+  dff <- peaks(i,data_air,adiaryair_set1)
+  apeaks_air1 <- rbind.fill(apeaks_air1,dff)
+}
+
+apeaks_air2 <- data.frame()
+for(i in tnum_a2){
+  dff <- peaks(i,data_air,adiaryair_set2)
+  apeaks_air2 <- rbind.fill(apeaks_air2,dff)
+}
+
+apeaks_air_all <- rbind.fill(apeaks_air1,apeaks_air2)
+
+apeaks_skin1 <- data.frame()
+for(i in tnum_s1){
+  dff <- peaks(i,data_skin,adiaryskin_set1)
+  apeaks_skin1 <- rbind.fill(apeaks_skin1,dff)
+}
+
+apeaks_skin2 <- data.frame()
+for(i in tnum_s2){
+  dff <- peaks(i,data_skin,adiaryskin_set2)
+  apeaks_skin2 <- rbind.fill(apeaks_skin2,dff)
+}
+
+apeaks_skin_all <- rbind.fill(apeaks_skin1,apeaks_skin2)
+```
+
+```{r detailed peak information function, include=FALSE}
+###### function to merge raw data with diaries and save all details about peaks. 
+# (peak temperature,peak time,peak day and peak location)
+
+ffunc <- function(Code_order,data,set){
+  x <- data[which(data$Code_order == Code_order),]
+  x$Index1<-1:nrow(x)
+  
+  #merge the diary data 
+  #diary data has only the participants' code and setting, not the type of the sensor
+  #in order to merge the diary with the air/skin sensors we create two subsets-dataframes 
+  y<-set[which(set$Code_order == Code_order),]
+  y<-data.frame(t(y))
+  
+  names(y)="X1"<-"Location"  #rename X1 to Location
+
+  #create another variable Index1 to be able to merge sensors data with diary data by it. (Index1 refers to time)
+  y$Index1<-1:nrow(y)
+  x<-merge(x = x, y = y, by = "Index1", all = TRUE)
+  x<-x[!(is.na(x$Temperature)) , ]
+  #smoothed the linegraph
+  loessMod5 <- loess(x$Temperature~Index1, data=x, span=0.1) # 10% smoothing span
+  x$smoothed5 <- predict(loessMod5) 
+
+  #find peaks 
+  pp <- findpeaks (x$smoothed5, nups = 1, ndowns = 0, minpeakheight = 0, minpeakdistance = 1, 
+                   threshold = 0.2, npeaks = 0, sortstr = FALSE)
+
+  #create a data frame showing the location of peaks/troughs  
+  data.peaks=data.frame(data.smoothed5=pp)
+  
+  #number of peaks
+  peaks1<-subset(data.peaks, select = data.smoothed5.2)
+  names(peaks1)='data.smoothed5.2'<- 'peaks'
+  
+  #find the sum of the peaks
+  peaks1$pnum_p<-nrow(peaks1)
+  #keep only one value for the sum to have a dataframe with 1 obs and 10 variables
+  peaks1<-setDT(peaks1)[, head(.SD,1)]
+  
+  #moving the sum of peaks into a new dataframe
+  numpeaks_skin<-subset(peaks1, select=pnum_p)
+  
+  #create dataset with temp values only and rename the variable 
+  z<-subset(data.peaks, select = c(data.smoothed5.1))
+  names(z)="data.smoothed5.1"<-"peaks"
+  
+  #matching the temp values with the original dataset to find the time of peaks
+  d1 <- data.table(z, key = 'peaks')
+  d2 <- data.table(x, key = 'smoothed5')
+  peaks1<-d2[d1]
+  
+  #create subset and rename the col names
+  z<-subset(peaks1, select=c(Code_order, smoothed5, Time, Location, Date))
+  names(z)[2] = "smoothed5" <- "P_temperature"
+  names(z) [3]= "Time"<- "P_time"
+  names(z) [4]= "Location"<- "P_location"
+  names(z) [5]= "Date"<- "P_date"
+  
+  df2p <- within(z, count <- ave(rep(1,nrow(z)),z$Code_order,FUN=cumsum))
+  df2p<-reshape(df2p,direction="wide",idvar="Code_order",timevar="count")
+  df2p$peaks<-numpeaks_skin$pnum_p
+
+  return(df2p)
+}
+
+```
+
+```{r create the detailed table of peaks using the custom function, include=F}
+dff <- data.frame()
+final_a1_mix <- data.frame()
+for(i in tnum_a1){
+  dff <- ffunc(i,data_air,diaryair_set1)
+  final_a1_mix <- rbind.fill(final_a1_mix,dff)
+}
+
+dff <- data.frame()
+final_a2_mix <- data.frame()
+for(i in tnum_a2){
+  dff <- ffunc(i,data_air,diaryair_set2)
+  final_a2_mix <- rbind.fill(final_a2_mix,dff)
+}
+
+final_air_mix <- rbind.fill(final_a1_mix,final_a2_mix)
+
+dff <- data.frame()
+final_s1_mix <- data.frame()
+for(i in tnum_s1){
+  dff <- ffunc(i,data_skin,diaryskin_set1)
+  final_s1_mix <- rbind.fill(final_s1_mix,dff)
+}
+final_s1_mix <- final_s1_mix[!is.na(final_s1_mix$Code_order),]
+
+
+dff <- data.frame()
+final_s2_mix <- data.frame()
+for(i in tnum_s2){
+  dff <- ffunc(i,data_skin,diaryskin_set2)
+  final_s2_mix <- rbind.fill(final_s2_mix,dff)
+}
+final_s2_mix <- final_s2_mix[!is.na(final_s2_mix$Code_order),]
+
+final_skin_mix <- rbind.fill(final_s1_mix,final_s2_mix)
+
+rm(dff)
+```
+
+```{r function merging raw and diary data, include=FALSE, eval=FALSE}
+#function to merge raw data and diary data
+raw_location_merge_func <- function(Code_order,data,set){
+  x <- data[which(data$Code_order == Code_order),] #loading the data
+  x$Index1<-1:nrow(x) #creating the index
+  
+  y<-set[which(set$Code_order == Code_order),] #loading the setting
+  y<-data.frame(t(y))
+  
+  #rename X1 to P_location
+  names(y)="X1"<-"Location"
+  #create another variable Index1 to be able to merge sensors data with diary data by it. (Index1 refers to time)
+  y$Index1<-1:nrow(y) 
+  x<-merge(x = x, y = y, by = "Index1", all = TRUE) #merge data and diary
+  x<-x[!(is.na(x$Temperature)) , ] # remove na temp
+  #smoothed the linegraph
+  loessMod5 <- loess(x$Temperature~Index1, data=x, span=0.1) # 10% smoothing span
+  x$smoothed5 <- predict(loessMod5) # find the smoothed data
+  Code_order <- x 
+  Code_order <- data.frame(Code_order)
+  tn <<- rbind.fill(tn,Code_order) # return data
+}
+```
+
+```{r merging air and diary data, include=FALSE, eval=FALSE}
+#air code orders
+tnumA <- c("T10-A1","T11-A1","T12-A1","T13-A1","T14-A1","T15-A1","T16-A1","T17-A1","T18-A1",
+           "T19-A1","T21-A1","T22-A1","T23-A1","T24-A1","T26-A1","T29-A1","T31-A1","T33-A1",
+           "T34-A1","T35-A1","T37-A1","T38-A1","T46-A1","T47-A1","T51-A1","T52-A1","T42-A1",
+           "T45-A1","T54-A1","T53-A1","T56-A1","T60-A1","T61-A1","T64-A1","T66-A1","T67-A1",
+           "T10-A2","T11-A2","T12-A2","T16-A2","T17-A2","T18-A2","T19-A2","T24-A2","T26-A2",
+           "T35-A2","T37-A2","T38-A2","T42-A2","T43-A2","T45-A2","T60-A2")
+
+tn <- data.frame()
+air_loc <- data.frame()
+for(i in tnumA){
+  dff <- raw_location_merge_func(i,data_air,diaryair)
+  air_loc <- rbind.fill(air_loc,dff)
+}
+TNUMAIR <- tn
+
+write.csv(TNUMAIR,"./temp_files/TNUMAIR.csv", row.names = F) # writing the new dataset
+```
+
+```{r merging skin and diary data, include=FALSE, eval=FALSE}
+# skin code orders
+tnumS <- c("T10-S1","T11-S1","T12-S1","T13-S1","T14-S1","T15-S1","T16-S1","T18-S1","T19-S1",
+           "T21-S1","T22-S1","T23-S1","T24-S1","T26-S1","T29-S1","T31-S1","T33-S1","T34-S1",
+           "T35-S1","T37-S1","T38-S1","T45-S1","T46-S1","T47-S1","T51-S1","T52-S1","T53-S1",
+           "T56-S1","T60-S1","T61-S1","T64-S1","T66-S1","T67-S1","T10-S2","T11-S2","T12-S2",
+           "T16-S2","T17-S2","T24-S2","T26-S2","T29-S2","T31-S2","T33-S2","T34-S2","T35-S2",
+           "T38-S2","T43-S2","T45-S2","T60-S2")
+
+tn <- data.frame()
+skin_loc <- data.frame()
+for(i in tnumS){
+  dff <- raw_location_merge_func(i,data_skin,diaryskin) #using the function to create the dataset
+  skin_loc <- rbind.fill(skin_loc,dff)
+}
+TNUMSKIN <- tn
+
+write.csv(TNUMSKIN,"./temp_files/TNUMSKIN.csv", row.names = F) # writing the new dataset
+```
+
+```{r peaks_summary, include=FALSE}
+
+#mean,median,IQR number of peaks
+summary(final_air_mix$peaks)
+summary(final_skin_mix$peaks)
+
+#mean,median,IQR values peaks
+summary(peaks_air_all$P_temperature)
+summary(peaks_skin_all$P_temperature)
+
+summary(peaks_air1$P_temperature)
+summary(peaks_air2$P_temperature)
+
+summary(peaks_skin1$P_temperature)
+summary(peaks_skin2$P_temperature)
+
+summary(data_skin$Activity) 
+```
+
+
+```{r normality test}
+#air sensor peaks both settings
+qqnorm(peaks_air_all$P_temperature) 
+hist(peaks_air_all$P_temperature)
+
+#skin sensor peaks both settings
+qqnorm(peaks_skin_all$P_temperature) 
+hist(peaks_skin_all$P_temperature)
+
+# qqplot for raw data temperature
+ggqqplot(data_air$Temperature)
+ggqqplot(data_skin$Temperature)
+
+# number of peaks
+qqnorm(final_air_mix$peaks)
+hist(final_air_mix$peaks)
+hist(final_skin_mix$peaks)
+```
+
+
+```{r}
+qqnorm(data_skin$Activity)
+qqnorm(log(data_skin$Activity + 1))
+```
+
+
+### Boxplot peaks
+```{r number of peaks boxplot, echo=FALSE}
+set1_air <- final_a1_mix %>% select(num=peaks) %>% 
+  mutate(type="peaks",set="Urban")
+
+set2_air <- final_a2_mix %>% select(num=peaks) %>% 
+  mutate(type="peaks",set="Rural")
+
+air_f <- rbind(set1_air,set2_air) %>% mutate(sensor="Air")
+
+# Adding the participants with zero peaks because findpeak can't found
+T421<- c(as.numeric("0"), "peaks", "Urban", "Air")
+T541<- c(as.numeric("0"), "peaks", "Urban", "Air")
+T451<- c(as.numeric("0"), "peaks", "Urban", "Air")
+air_f <- rbind(air_f,T421,T541,T451) %>% mutate(num=as.numeric(num))
+
+### skin
+set1_skin <- final_s1_mix %>% select(num=peaks) %>% 
+  mutate(type="peaks",set="Urban")
+
+set2_skin <- final_s2_mix %>% select(num=peaks) %>% 
+  mutate(type="peaks",set="Rural")
+
+
+skin_f <- rbind(set1_skin,set2_skin) %>% mutate(sensor="Skin",num=as.numeric(num))
+
+total_f <- rbind(air_f,skin_f)
+
+ggplot(data = total_f, aes(x = type, y = num)) +geom_boxplot() +  facet_grid(sensor~set) + geom_jitter(width = 0.2) +ylab("Number of Peaks")
+```
+
+
+
+# Temperature plots for Location Settings
+```{r mean temp air urban, echo=FALSE, warning=FALSE}
+knitr::kable(peaks_air1 %>% group_by(P_location) %>% summarise_each(mean,P_temperature) %>% mutate(Location=P_location,Mean_Temperature=P_temperature) %>% select(Location,Mean_Temperature), caption="Mean Temperature values of peaks for Air Sensors Urban")
+```
+```{r mean temp air rural, echo=FALSE, warning=FALSE}
+knitr::kable(peaks_air2 %>% group_by(P_location) %>% summarise_each(mean,P_temperature) %>% mutate(Location=P_location,Mean_Temperature=P_temperature) %>% select(Location,Mean_Temperature), caption="Mean Temperature values of peaks for Air Sensors Rural")
+```
+
+```{r temp box air urban, echo=FALSE}
+peaks_air1 %>% mutate(P_location= fct_reorder(P_location, P_temperature)) %>%
+  filter(!is.na(P_location) & P_location %in% c("indoor_activities","outdoor_activities")) %>%
+  ggplot(aes(P_temperature,P_location)) + geom_boxplot() + xlab("Temperature") + ylab("Location") + ggtitle("Boxplot of peaks on Air sensors for Urban settings")
+```
+
+```{r temp boxplot air rural, echo=FALSE}
+peaks_air2 %>% mutate(P_location= fct_reorder(P_location, P_temperature)) %>%
+  filter(!is.na(P_location) & P_location %in% c("indoor_activities","outdoor_activities")) %>%
+  ggplot(aes(P_temperature,P_location)) + geom_boxplot() + xlab("Temperature") + ylab("Location") + ggtitle("Boxplot of peaks on Air sensors for Rural settings")
+```
+
+
+### Skin Sensor
+
+```{r mean temp skin urban, echo=FALSE, warning=FALSE}
+knitr::kable(peaks_skin1 %>% group_by(P_location) %>% summarise_each(mean,P_temperature) %>% mutate(Location=P_location,Mean_Temperature=P_temperature) %>% select(Location,Mean_Temperature), caption="Mean Temperature values of peaks for Skin Sensors Urban")
+```
+
+```{r mean temp skin rural, echo=FALSE, warning=FALSE}
+knitr::kable(peaks_skin2 %>% group_by(P_location) %>% summarise_each(mean,P_temperature) %>% mutate(Location=P_location,Mean_Temperature=P_temperature) %>% select(Location,Mean_Temperature), caption="Mean Temperature values of peaks for Skin Sensors Rural")
+```
+
+```{r temp box skin urban, echo=FALSE}
+peaks_skin1 %>% mutate(P_location= fct_reorder(P_location, P_temperature)) %>%
+  filter(!is.na(P_location) & P_location %in% c("indoor_activities","outdoor_activities")) %>%
+  ggplot(aes(P_temperature,P_location)) + geom_boxplot() + xlab("Temperature") + ylab("Location") + ggtitle("Boxplot of peak temperatures on Skin sensors for Urban settings")
+```
+```{r temp box skin rural, echo=FALSE}
+peaks_skin2 %>% mutate(P_location= fct_reorder(P_location, P_temperature)) %>%
+  filter(!is.na(P_location) & P_location %in% c("indoor_activities","outdoor_activities")) %>%
+  ggplot(aes(P_temperature,P_location)) + geom_boxplot() + xlab("Temperature") + ylab("Location") + ggtitle("Boxplot of peak temperatures on Skin sensors for Rural settings")
+```
+
+
+```{r creating peak table for air with in/out location, echo=FALSE}
+ind_air1 <- peaks_air1 %>% filter(P_location=="indoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="indoor_activities",settings="Urban",sensor="Air") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+ind_air2 <- peaks_air2 %>% filter(P_location=="indoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="indoor_activities",settings="Rural",sensor="Air") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+outd_air1 <- peaks_air1 %>% filter(P_location=="outdoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="outdoor_activities",settings="Urban",sensor="Air") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+outd_air2 <- peaks_air2 %>% filter(P_location=="outdoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="outdoor_activities",settings="Rural",sensor="Air") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+
+total_air <- rbind(ind_air1,ind_air2,outd_air1,outd_air2) %>% 
+  select("Code_order","num_of_peaks","location","settings","sensor","Group")
+
+rm(ind_air1,ind_air2,outd_air1,outd_air2)
+```
+
+
+```{r creating peak table for skin with in/out location, echo=FALSE}
+ind_skin1 <- peaks_skin1 %>% filter(P_location=="indoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="indoor_activities",settings="Urban",sensor="Skin") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+ind_skin2 <- peaks_skin2 %>% filter(P_location=="indoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="indoor_activities",settings="Rural",sensor="Skin") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+outd_skin1 <- peaks_skin1 %>% filter(P_location=="outdoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="outdoor_activities",settings="Urban",sensor="Skin") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+outd_skin2 <- peaks_skin2 %>% filter(P_location=="outdoor_activities") %>% 
+  mutate(index=as.numeric("1")) %>% group_by(Code_order) %>% summarise_each(sum,index) %>%
+  mutate(location="outdoor_activities",settings="Rural",sensor="Skin") %>% 
+  mutate(num_of_peaks=index) %>% merge(tempdata_final[,c(2,10)], by="Code_order", all.x=T) %>%
+  select(-index) %>% distinct()
+
+total_skin <- rbind(ind_skin1,ind_skin2,outd_skin1,outd_skin2) %>% 
+  select("Code_order","num_of_peaks","location","settings","sensor","Group")
+
+rm(ind_skin1,ind_skin2,outd_skin1,outd_skin2)
+```
+
+```{r, echo=FALSE}
+total_air_skin <- rbind(total_air,total_skin)
+```
+
+
+```{r number of peaks boxplot in/out, echo=F}
+ggplot(total_air_skin,aes(x = settings, y = num_of_peaks)) +geom_boxplot(aes(fill=settings)) +  facet_grid(sensor~location, scale="free") + ylim(-1,10) + geom_jitter() + ylab("Number of peaks") + xlab("Settings")
+```
+
+```{r boxplot temp in/out, echo=FALSE}
+datf1 <- peaks_air_all %>% filter(P_location=="indoor_activities")  
+datf1 <- datf1[,c(1:4)]
+datfAI <- merge(datf1, total_air[,c(1,4:6)],by="Code_order",all.x=T) %>% distinct()
+
+datf2 <- peaks_skin_all %>% filter(P_location=="indoor_activities")
+datf2 <- datf2[,c(1:4)]
+datfSI <- merge(datf2, total_skin[,c(1,4:6)],by="Code_order",all.x=T) %>% distinct()
+
+datf3 <- peaks_air_all %>% filter(P_location=="outdoor_activities")
+datf3 <- datf3[,c(1:4)]
+datfAO <- merge(datf3, total_air[,c(1,4:6)],by="Code_order",all.x=T) %>% distinct()
+
+datf4 <- peaks_skin_all %>% filter(P_location=="outdoor_activities")
+datf4 <- datf4[,c(1:4)]
+datfSO <- merge(datf4, total_skin[,c(1,4:6)],by="Code_order",all.x=T) %>% distinct()
+
+peaks_data <- rbind(datfAI,datfSI,datfAO,datfSO)
+
+ggplot(peaks_data,aes(x = settings, y = P_temperature)) +geom_boxplot(aes(fill=settings)) +  facet_grid(sensor~P_location, scales = "free") + geom_jitter() + ylab("Temperature of Peak") + xlab("Settings")
+
+rm(datf1,datf2,datf3,datf4,datfAI,datfSI,datfAO,datfSO)
+```
+
+### Summary table of peak temperature per setting on air sensors
+
+`r kable(print(CreateTableOne("P_temperature", data=peaks_data[peaks_data$sensor=="Air",], strata="settings"),testNonNormal = kruskal.test, nonnormal = "P_Temperature"), caption="Summary table of peak temperature by setting for air sensors")`
+
+### Summary table of peak temperature per setting on skin sensors
+
+`r kable(print(CreateTableOne("P_temperature", data=peaks_data[peaks_data$sensor=="Skin",], strata="settings"),testNonNormal = kruskal.test, nonnormal = "P_Temperature"), caption="Summary table of peak temperature by setting for skin sensors")`
+
+### Summary table of number of peaks per setting on air sensors
+
+`r kable(print(CreateTableOne("num", data=air_f, strata="set"),testNonNormal = kruskal.test, nonnormal = "num"), caption="Summary table of number of peaks by setting for air sensor")`
+
+### Summary table of number of peaks per setting on skin sensors
+
+`r kable(print(CreateTableOne("num", data=skin_f, strata="set"),testNonNormal = kruskal.test, nonnormal = "num"), caption="Summary table of number of peaks by setting for skin sensor")`
+
+### Summary table of number of peaks at Indoor/Outdoor location per setting on air sensors
+
+`r kable(print(CreateTableOne("num_of_peaks", data=total_air, strata="settings"),testNonNormal = kruskal.test, nonnormal = "num_of_peaks"), caption="Summary table of number of peaks by setting for air sensor at Indoor/Outdoor location")`
+
+### Summary table of number of peaks at Indoor/Outdoor location per setting on skin sensors
+
+`r kable(print(CreateTableOne("num_of_peaks", data=total_skin, strata="settings"),testNonNormal = kruskal.test, nonnormal = "num_of_peaks"), caption="Summary table of number of peaks by setting for skin sensor at Indoor/Outdoor location")`
+
+
+
+### Temperature and Activity correlation
+
+
+```{r, include=FALSE}
+TNUMAIR <- read.csv("./temp_files/TNUMAIR.csv") #loading the air data
+
+TNUMSKIN <- read.csv("./temp_files/TNUMSKIN.csv") #loading the skin data
+
+# filtering data with only indoor outdoor activities
+TNUMSKIN_l <- TNUMSKIN %>% filter(Location %in% c("indoor_activities","outdoor_activities"))
+
+TNUMAIR_l <- TNUMAIR %>% filter(Location %in% c("indoor_activities","outdoor_activities"))
+
+peaks_data_air_activity <- peaks_data %>% filter(sensor=="Air") %>% 
+  merge(TNUMAIR[,c(3,6,9)], all.x=T, by.x=c("Code_order","P_time"), by.y=c("Code_order","Time"))
+
+peaks_data_skin_activity <- peaks_data %>% filter(sensor=="Skin") %>%
+  merge(TNUMSKIN[,c(3,6,9)], all.x=T, by.x=c("Code_order","P_time"),by.y=c("Code_order","Time"))
+
+peaks_data_activity <- rbind(peaks_data_air_activity, peaks_data_skin_activity)
+rm(peaks_data_air_activity, peaks_data_skin_activity)
+```
+
+
+```{r}
+# ploting Temperature and Activity.
+plot(TNUMSKIN_l$Temperature, TNUMSKIN_l$Activity)
+#correlation between Temperature and Activity for Urban
+cor.test(TNUMSKIN_l[TNUMSKIN_l$settings=="1","Temperature"],TNUMSKIN_l[TNUMSKIN_l$settings=="1","Activity"], method="spearman", exact=F)
+```
+
+```{r}
+#correlation between Temperature and Activity for Rural
+cor.test(TNUMSKIN_l[TNUMSKIN_l$settings=="2","Temperature"],TNUMSKIN_l[TNUMSKIN_l$settings=="2","Activity"], method="spearman", exact=F)
+```
+
+```{r bmi_age, include=F}
+### adding BMI and Age
+bmiage <- chrono %>% select(1,3:6) %>% mutate(BMI=round(Weight/(Height/100)^2),2) %>% 
+  select(1:3,6) %>% mutate(Sex=as.factor(Sex)) %>%
+  mutate(Sex=ifelse(Sex=="1","Female","Male"))
+```
+
+
+```{r, include=F}
+total_air <- total_air %>% mutate_if(is.character,as.factor) %>%  #change object type
+  tidyr::separate(Code_order, c("Code", "Order"), sep = "-", remove=F) %>%
+  merge(bmiage, all.x=T, by="Code") %>% #merging data with bmi
+  mutate_if(is.character,as.factor) %>% #change object type
+  mutate(location=relevel(location, ref="indoor_activities")) %>% #change reference group
+  mutate(settings=relevel(settings, ref="Urban")) %>% #change reference group
+  mutate_if(is.character,as.factor) #change object type
+```
+
+```{r, include=F}
+
+total_skin <- total_skin %>% mutate_if(is.character,as.factor) %>%  #change object type
+  tidyr::separate(Code_order, c("Code", "Order"), sep = "-", remove=F) %>%
+  merge(bmiage, all.x=T, by="Code") %>% #merging data with bmi
+  mutate_if(is.character,as.factor) %>% #change object type
+  mutate(location=relevel(location, ref="indoor_activities")) %>% #change reference group
+  mutate(settings=relevel(settings, ref="Urban")) %>% #change reference group
+  mutate_if(is.character,as.factor) #change object type
+```
+
+
+
+```{r, include=F}
+TNUMAIR_l <- TNUMAIR_l %>% mutate_if(is.character,as.factor) %>% #change object type
+  mutate(settings=ifelse(settings=="1","Urban","Rural")) %>% # change index
+  merge(bmiage, all.x=T,by="Code") %>% #merging data with bmi
+  mutate(logTemperature=scale(log(Temperature))) %>%
+  mutate_if(is.character,as.factor) %>% #change object type
+  mutate(Location=relevel(Location, ref="indoor_activities")) %>% #change reference group
+  mutate(settings=relevel(settings, ref="Urban")) %>% #change reference group
+  mutate_if(is.character,as.factor) #change object type
+```
+
+```{r, include=F}
+TNUMSKIN_l <- TNUMSKIN_l %>% mutate_if(is.character,as.factor) %>% #change object type
+  mutate(settings=ifelse(settings=="1","Urban","Rural")) %>% # change index
+  merge(bmiage, all.x=T,by="Code") %>% #merging data with bmi
+  mutate(logTemperature=scale(log(Temperature))) %>% # log and z-score transformation
+   #creating activity group
+  mutate(Activity_Group=ifelse(Activity==0,"No_Activity","Any_Activity")) %>% 
+  mutate_if(is.character,as.factor) %>% #change object type
+#change reference group
+  mutate(Location=relevel(Location, ref="indoor_activities")) %>% 
+  mutate(settings=relevel(settings, ref="Urban")) %>% 
+  mutate(Activity_Group=relevel(Activity_Group, ref="No_Activity")) %>% 
+  mutate_if(is.character,as.factor) #change object type
+```
+
+### Summary table for ambient air temperature by setting taking in account all observations
+
+`r kable(print(CreateTableOne("Temperature", data=TNUMAIR_l, strata="Location"),testNonNormal = kruskal.test, nonnormal = "Temperature"), caption="Summary table of ambient air temperature by setting")`
+
+### Summary table for skin temperature by setting taking in account all observations
+
+`r kable(print(CreateTableOne("Temperature", data=TNUMSKIN_l, strata="Location"),testNonNormal = kruskal.test, nonnormal = "Temperature"), caption="Summary table of skin temperature by setting")`
+
+### Summary table of cumulative activity by settting based on skin sensors
+
+`r kable(print(CreateTableOne("Activity", data=TNUMSKIN_l, strata="Location"),testNonNormal = kruskal.test, nonnormal = "Activity"), caption="Summary table of cumulative activity per day based on skin sensors") `
+
+### Summary table of peak temperature per setting on air sensors
+
+`r kable(print(CreateTableOne("P_temperature", data=peaks_data[peaks_data$sensor=="Air",], strata="P_location"),testNonNormal = kruskal.test, nonnormal = "P_Temperature"), caption="Summary table of peak temperature by setting for air sensors")`
+
+### Summary table of peak temperature per setting on skin sensors
+
+`r kable(print(CreateTableOne("P_temperature", data=peaks_data[peaks_data$sensor=="Skin",], strata="P_location"),testNonNormal = kruskal.test, nonnormal = "P_Temperature"), caption="Summary table of peak temperature by setting for skin sensors")`
+
+
+### Summary table of number of peaks at Indoor/Outdoor location per setting on air sensors
+
+`r kable(print(CreateTableOne("num_of_peaks", data=total_air, strata="location"),testNonNormal = kruskal.test, nonnormal = "num_of_peaks"), caption="Summary table of number of peaks by setting for air sensor at Indoor/Outdoor location")`
+
+### Summary table of number of peaks at Indoor/Outdoor location per setting on skin sensors
+
+`r kable(print(CreateTableOne("num_of_peaks", data=total_skin, strata="location"),testNonNormal = kruskal.test, nonnormal = "num_of_peaks"), caption="Summary table of number of peaks by setting for skin sensor at Indoor/Outdoor location")`
+
+
+### MODELS
+
+#### Reference for Location is "indoor_activities" and "Urban" for setting for all 4 dataframes
+
+
+```{r models 1, warning=FALSE, message=FALSE}
+model_LSBA <-  glmer(Location ~ settings + BMI + Age + Sex + logTemperature + (1|Code),data= TNUMAIR_l, family = binomial(link="logit"),   control=glmerControl(optimizer = "bobyqa")) 
+
+model_S_LSAAB <- glmer(Location ~ settings + BMI + Age + Sex + logTemperature + Activity_Group + (1|Code),data= TNUMSKIN_l, family = binomial(link="logit"),   control=glmerControl(optimizer = "bobyqa"))
+
+tab_model(model_LSBA, model_S_LSAAB, digits=3, title="Mixed Effect Models for Location~ Settings + BMI + Age + Temperature + Activity(for skin sensor) + random(Participant) for raw data air and skin sensor")
+```
+
+```{r models 2,warning=FALSE, message=FALSE}
+model_S_LB22 <- glmer(location ~ settings + num_of_peaks + Age + BMI + Sex + (1|Code),data= total_air, family = binomial(link="logit"),   control=glmerControl(optimizer = "bobyqa"), na.action = na.omit)
+
+model_S_LB2 <- glmer(location ~ settings + num_of_peaks + Age + BMI + Sex + (1|Code),data= total_skin, family = binomial(link="logit"),   control=glmerControl(optimizer = "bobyqa"), na.action = na.omit)
+
+tab_model(model_S_LB22, model_S_LB2, digits= 3, title= "Mixed effect models for Location ~ Setting + Number of peaks + Age + BMI  + random(Participant) for number of peaks data for Air and Skin sensor")
+```
+
+```{r models 3, warning=FALSE, message=FALSE}
+model_LTS <- glmer(Location ~ logTemperature + settings + logTemperature*settings + (1|Code),data= TNUMAIR_l, family = binomial)
+
+model_S_LTS <- glmer(Location ~ logTemperature + settings + logTemperature*settings + (1|Code),data= TNUMSKIN_l, family = binomial)
+
+tempmodels <- c(model_LTS,model_S_LTS)
+
+tab_model(tempmodels, digits = 3, title = "Mixed effect models for Location ~ Temperature + setting + interaction Temperature:setting + random(Participant) for raw data Air and Skin sensor")
+```
+
+```{r models 4, warning=FALSE, message=FALSE}
+model_tempU <- glmer(Location ~ logTemperature + (1|Code),data= TNUMAIR_l[TNUMAIR_l$settings=="Urban",], family = binomial)
+
+model_tempR <- glmer(Location ~ logTemperature + (1|Code),data= TNUMAIR_l[TNUMAIR_l$settings=="Rural",], family = binomial)
+
+model_tempUS <- glmer(Location ~ logTemperature + (1|Code),data= TNUMSKIN_l[TNUMSKIN_l$settings=="Urban",], family = binomial)
+
+model_tempRS <- glmer(Location ~ logTemperature + (1|Code),data= TNUMSKIN_l[TNUMSKIN_l$settings=="Rural",], family = binomial)
+
+tab_model(model_tempU, model_tempR, model_tempUS, model_tempRS, digits = 3, title = "Mixed effect models for Location ~ Temperature + random(Participant) per Sensor(Air/Skin) and per setting(Urban/Rural)")
+```
+
+
+
+
